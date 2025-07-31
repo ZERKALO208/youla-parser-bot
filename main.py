@@ -1,90 +1,159 @@
-import asyncio
-from aiogram import Bot, Dispatcher, types
-from aiogram.utils import executor
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
+import telebot
+import requests
 import time
-import urllib.parse
+import re
+from bs4 import BeautifulSoup
+from fake_useragent import UserAgent
+from threading import Thread
+import os
 
-# Вставь сюда свой Telegram ID (только ты сможешь пользоваться ботом)
-ALLOWED_USERS = [7777713334]
+TOKEN = os.getenv("BOT_TOKEN")
+bot = telebot.TeleBot(TOKEN)
 
-BOT_TOKEN = "ВАШ_ТОКЕН_ТУТ"  # Замени на свой токен бота
+# Хранение ID разрешённого пользователя
+ALLOWED_USER_ID = 7777713334
 
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(bot)
+# Флаг для отслеживания статуса парсинга
+parsing_active = False
 
-MAX_VIEWS = 50  # Можно менять через переменные окружения или тут
+def get_phone(item_id):
+    try:
+        url = f"https://youla.ru/web-api/items/{item_id}/phone"
+        headers = {
+            "User-Agent": UserAgent().random,
+            "Accept": "application/json"
+        }
+        response = requests.get(url, headers=headers)
+        if response.status_code == 200:
+            data = response.json()
+            phone = data.get("phone", "")
+            if phone:
+                return phone
+    except Exception as e:
+        print("Ошибка получения телефона:", e)
+    return None
 
-def is_allowed(user_id):
-    return user_id in ALLOWED_USERS
+def is_user_without_reviews(soup):
+    try:
+        reviews_tag = soup.find("div", {"data-testid": "seller-rating-summary"})
+        return reviews_tag is None
+    except:
+        return False
 
-def create_whatsapp_link(phone, name, price):
-    text = f"Здравствуйте. Подскажите, пожалуйста, объявление о продаже {name} за {price} еще актуально?"
-    text_encoded = urllib.parse.quote(text)
-    phone_clean = phone.replace("+", "").replace(" ", "").replace("-", "")
-    return f"https://wa.me/{phone_clean}?text={text_encoded}"
-
-def create_telegram_link(phone, name, price):
-    text = f"Здравствуйте. Подскажите, пожалуйста, объявление о продаже {name} за {price} еще актуально?"
-    text_encoded = urllib.parse.quote(text)
-    return f"https://t.me/share/url?url=tg://&text={text_encoded}"
-
-async def send_advertisement(ad):
-    name = ad['name']
-    price = ad['price']
-    link = ad['link']
-    phone = ad['phone']
-
-    whatsapp_link = create_whatsapp_link(phone, name, price)
-    telegram_link = create_telegram_link(phone, name, price)
-
-    message = (
-        f"🛍 Название товара: {name}\n"
-        f"💰 Цена: {price}\n\n"
-        f"🔗 Ссылка: [Открыть ссылку]({link})\n"
-        f"📞 Номер: {phone}\n\n"
-        f"🟢 WhatsApp API: [Связаться в WA]({whatsapp_link})\n"
-        f"📨 Телеграм: [Связаться в ТГ]({telegram_link})"
-    )
-    return message
-
-async def parse_youla():
-    options = Options()
-    options.add_argument("--headless")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--no-sandbox")
-    driver = webdriver.Chrome(options=options)
-
-    ads = []
-
-    # Здесь можно добавить список категорий Youla
+def parse_youla(min_views):
+    url = "https://youla.ru"
     categories = [
-        "https://youla.ru/moskva?q=&max_view=50"  # пример категории с фильтром по просмотрам
-        # Добавь другие категории при необходимости
+        "turizm", "odezhda-obuv", "elektronika", "bytovaya-tehnika", 
+        "detskiy-mir", "hobbi-otdyh-i-sport", "zhivotnye", "uslugi"
     ]
 
-    for category_url in categories:
-        driver.get(category_url)
-        time.sleep(3)  # Ждем загрузки страницы
+    results = []
 
-        items = driver.find_elements(By.CSS_SELECTOR, "a.snippet-link")
-        for item in items:
-            try:
-                link = item.get_attribute("href")
-                name = item.find_element(By.CSS_SELECTOR, ".snippet-title").text
-                price = item.find_element(By.CSS_SELECTOR, ".price").text
+    for category in categories:
+        try:
+            full_url = f"{url}/{category}"
+            headers = {
+                "User-Agent": UserAgent().random
+            }
+            response = requests.get(full_url, headers=headers)
 
-                driver.get(link)
-                time.sleep(2)
+            if response.status_code != 200:
+                continue
 
-                # Номер телефона (в зависимости от сайта, может понадобиться дополнительный парсинг)
-                phone = driver.find_element(By.CSS_SELECTOR, ".seller-phone").text
+            soup = BeautifulSoup(response.text, "html.parser")
+            items = soup.select('a[href^="/item/"]')
 
-                # Проверка отзывов продавца (пример, нужно подстроить под сайт)
-                reviews = driver.find_elements(By.CSS_SELECTOR, ".seller-reviews")
-                if reviews:
-                    continue  # пропускаем если есть отзывы
+            for item in items:
+                try:
+                    href = item.get("href")
+                    item_url = url + href
+                    item_id = href.split("/")[-1]
 
-                # Добавляем в список объявлений
+                    item_resp = requests.get(item_url, headers=headers)
+                    item_soup = BeautifulSoup(item_resp.text, "html.parser")
+
+                    if not is_user_without_reviews(item_soup):
+                        continue
+
+                    views_tag = item_soup.find("span", string=re.compile("Просмотров:"))
+                    if views_tag:
+                        views_match = re.search(r"Просмотров:\s*(\d+)", views_tag.text)
+                        if views_match and int(views_match.group(1)) > min_views:
+                            continue
+
+                    title_tag = item_soup.find("h1")
+                    price_tag = item_soup.find("h3")
+                    title = title_tag.text.strip() if title_tag else "Без названия"
+                    price = price_tag.text.strip() if price_tag else "Не указана"
+
+                    phone = get_phone(item_id)
+                    if not phone:
+                        continue
+
+                    result = {
+                        "title": title,
+                        "price": price,
+                        "phone": phone,
+                        "url": item_url
+                    }
+
+                    # Добавляем в список объявлений
+                    results.append(result)
+
+                except Exception as inner_error:
+                    print("Ошибка при обработке объявления:", inner_error)
+
+        except Exception as e:
+            print("Ошибка при парсинге категории:", e)
+
+    return results
+
+
+@bot.message_handler(commands=['start'])
+def handle_start(message):
+    if message.chat.id != ALLOWED_USER_ID:
+        bot.send_message(message.chat.id, "⛔ Доступ запрещён.")
+        return
+    bot.send_message(message.chat.id, "👋 Бот запущен. Напиши /parse чтобы начать.")
+
+
+@bot.message_handler(commands=['parse'])
+def handle_parse(message):
+    if message.chat.id != ALLOWED_USER_ID:
+        bot.send_message(message.chat.id, "⛔ У вас нет доступа.")
+        return
+
+    global parsing_active
+    if parsing_active:
+        bot.send_message(message.chat.id, "⏳ Парсинг уже идёт...")
+        return
+
+    parsing_active = True
+    bot.send_message(message.chat.id, "🔍 Начинаю поиск объявлений...")
+
+    def task():
+        try:
+            items = parse_youla(min_views=50)
+            if not items:
+                bot.send_message(message.chat.id, "❌ Ничего не найдено.")
+            else:
+                for item in items:
+                    text = (
+                        f"🛍 Название товара: {item['title']}\n"
+                        f"💰 Цена: {item['price']}\n\n"
+                        f"🔗 Ссылка: {item['url']}\n"
+                        f"📞 Номер: {item['phone']}\n\n"
+                        f"💬 Telegram: https://t.me/{item['phone'].replace('+', '')}?text="
+                        f"Здравствуйте.%20Подскажите,%20пожалуйста,%20объявление%20о%20продаже%20{item['title']}%20за%20{item['price']}%20еще%20актуально?"
+                    )
+                    bot.send_message(message.chat.id, text)
+        except Exception as e:
+            bot.send_message(message.chat.id, f"⚠️ Ошибка парсинга: {e}")
+        finally:
+            global parsing_active
+            parsing_active = False
+
+    Thread(target=task).start()
+
+
+bot.polling(none_stop=True)
